@@ -209,11 +209,78 @@ public class LocalProcess {
     var childMonitor: DispatchSourceProcess?
 #endif
 
+    // Used to avoid reporting termination for a stale PID when a process is restarted quickly.
+    private let terminationLock = NSLock()
+    private var terminationGeneration: UInt64 = 0
+
+    /// Decode POSIX waitpid status into a more useful "exit code" value.
+    /// - Normal exit: returns 0...255
+    /// - Signal termination: returns negative signal number (e.g. -15 for SIGTERM)
+    /// - Unknown/invalid: nil
+    private static func decodeWaitStatus(_ status: Int32) -> Int32? {
+        // If exited normally, low 7 bits are 0 and high byte is the exit code.
+        if (status & 0x7f) == 0 {
+            return (status >> 8) & 0xff
+        }
+        // If terminated by signal, low 7 bits contain the signal number (bit 7 may indicate core dump).
+        let sig = status & 0x7f
+        if sig != 0 {
+            return -sig
+        }
+        return nil
+    }
+
+    /// Start a termination monitor that cannot crash the host process.
+    ///
+    /// IMPORTANT:
+    /// `DispatchSource.makeProcessSource` can *abort* the process when it fails to create the source.
+    /// We avoid that API here and use a background `waitpid` instead.
+    private func beginWaitPidTerminationMonitor(pid: pid_t) {
+        guard pid > 0 else {
+            // Invalid PID; fail gracefully.
+            dispatchQueue.async { [weak self] in
+                guard let self else { return }
+                self.running = false
+                self.delegate?.processTerminated(self, exitCode: nil)
+            }
+            return
+        }
+
+        terminationLock.lock()
+        terminationGeneration &+= 1
+        let generation = terminationGeneration
+        terminationLock.unlock()
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            var status: Int32 = 0
+            let waited = waitpid(pid, &status, 0)
+            let exitCode: Int32? = (waited == -1) ? nil : LocalProcess.decodeWaitStatus(status)
+
+            guard let self else { return }
+            self.dispatchQueue.async { [weak self] in
+                guard let self else { return }
+
+                self.terminationLock.lock()
+                let isCurrent = (self.terminationGeneration == generation) && (self.shellPid == pid)
+                self.terminationLock.unlock()
+                guard isCurrent else { return }
+
+                self.running = false
+                self.delegate?.processTerminated(self, exitCode: exitCode)
+            }
+        }
+    }
+
     func processTerminated ()
     {
-        var n: Int32 = 0
-        waitpid (shellPid, &n, WNOHANG)
-        delegate?.processTerminated(self, exitCode: n)
+        // Legacy path (was used by DispatchSourceProcess). Keep it safe/decoded if called.
+        var status: Int32 = 0
+        let result = waitpid (shellPid, &status, WNOHANG)
+        if result == 0 {
+            return
+        }
+        let exitCode: Int32? = (result == -1) ? nil : LocalProcess.decodeWaitStatus(status)
+        delegate?.processTerminated(self, exitCode: exitCode)
         running = false
     }
     
@@ -356,20 +423,15 @@ public class LocalProcess {
         }
 
         if let (shellPid, childfd) = PseudoTerminalHelpers.fork(andExec: executable, args: shellArgs, env: env, currentDirectory: currentDirectory, desiredWindowSize: &size) {
-#if os(macOS)
-            childMonitor = DispatchSource.makeProcessSource(identifier: shellPid, eventMask: .exit, queue: dispatchQueue)
-            if let cm = childMonitor {
-                if #available(macOS 10.12, *) {
-                    cm.activate()
-                } else {
-                    // Fallback on earlier versions
-                }
-                cm.setEventHandler(handler: { [weak self] in self?.processTerminated () })
-            }
-#endif
             running = true
             self.childfd = childfd
             self.shellPid = shellPid
+
+#if os(macOS)
+            // Do NOT use DispatchSource.makeProcessSource here (it can abort the host process).
+            // Use a waitpid-based monitor instead.
+            beginWaitPidTerminationMonitor(pid: shellPid)
+#endif
             // Capture FD value for cleanup handler to close it safely after DispatchIO is done
             let fdToClose = childfd
             io = DispatchIO(type: .stream, fileDescriptor: childfd, queue: dispatchQueue, cleanupHandler: { _ in
@@ -383,6 +445,13 @@ public class LocalProcess {
             io.setLimit(lowWater: 1)
             io.setLimit(highWater: readSize)
             io.read(offset: 0, length: readSize, queue: readQueue, ioHandler: childProcessRead)
+        } else {
+            // Failed to launch at all: report gracefully (prevents UI from thinking it's "running" forever).
+            dispatchQueue.async { [weak self] in
+                guard let self else { return }
+                self.running = false
+                self.delegate?.processTerminated(self, exitCode: nil)
+            }
         }
     }
 
