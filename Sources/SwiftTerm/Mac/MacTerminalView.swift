@@ -191,12 +191,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     func setupFocusNotification() {
-        becomeMainObserver = NotificationCenter.default.addObserver(forName: .init("NSWindowDidBecomeMainNotification"), object: nil, queue: nil) { [unowned self] notification in
-            self.caretView.updateCursorStyle()
+        becomeMainObserver = NotificationCenter.default.addObserver(forName: .init("NSWindowDidBecomeMainNotification"), object: nil, queue: nil) { [weak self] _ in
+            self?.caretView.updateCursorStyle()
         }
-        resignMainObserver = NotificationCenter.default.addObserver(forName: .init("NSWindowDidResignMainNotification"), object: nil, queue: nil) { [unowned self] notification in
-            self.caretView.disableAnimations()
-            self.caretView.updateView()
+        resignMainObserver = NotificationCenter.default.addObserver(forName: .init("NSWindowDidResignMainNotification"), object: nil, queue: nil) { [weak self] _ in
+            self?.caretView.disableAnimations()
+            self?.caretView.updateView()
         }
     }
     
@@ -908,9 +908,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return Position (col: Int (x), row: Int (bounds.height-y))
         }
         let displayBuffer = terminal.displayBuffer
+        guard cellDimension.width > 0, cellDimension.height > 0 else {
+            return (Position(col: 0, row: 0), toInt(point))
+        }
         let col = Int (point.x / cellDimension.width)
         let row = Int ((frame.height-point.y) / cellDimension.height)
-        let colValue = min (max (0, col), terminal.cols-1)
+        let cols = max(terminal.cols, 1)
+        let colValue = min (max (0, col), cols - 1)
         let bufferRow = row + displayBuffer.yDisp
         let maxRow = max (0, displayBuffer.lines.count - 1)
         let rowValue = min (max (0, bufferRow), maxRow)

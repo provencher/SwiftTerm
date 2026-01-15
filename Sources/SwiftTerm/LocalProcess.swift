@@ -83,6 +83,7 @@ public class LocalProcess {
     // read here and then post to the main thread.   Otherwise it feels
     // chunky.
     var readQueue: DispatchQueue
+    var writeQueue: DispatchQueue
     
     var io: DispatchIO?
     
@@ -106,6 +107,7 @@ public class LocalProcess {
         self.delegate = delegate
         self.dispatchQueue = dispatchQueue ?? DispatchQueue.main
         self.readQueue = DispatchQueue(label: "sender")
+        self.writeQueue = DispatchQueue(label: "sender.write")
     }
     
     /**
@@ -114,7 +116,7 @@ public class LocalProcess {
      */
     public func send (data: ArraySlice<UInt8>)
     {
-        guard running else {
+        guard running, childfd >= 0, let io else {
             return
         }
         let copy = sendCount
@@ -126,15 +128,17 @@ public class LocalProcess {
                 print ("[SEND-\(copy)] Queuing data to client: \(data) ")
             }
 
-            DispatchIO.write(toFileDescriptor: childfd, data: ddata, runningHandlerOn: DispatchQueue.global(qos: .userInitiated), handler:  { dd, errno in
-                self.total += copyCount
-                if self.debugIO {
-                    print ("[SEND-\(copy)] completed bytes=\(self.total)")
+            io.write(offset: 0, data: ddata, queue: writeQueue) { done, _, errno in
+                if done {
+                    self.total += copyCount
+                    if self.debugIO {
+                        print ("[SEND-\(copy)] completed bytes=\(self.total)")
+                    }
                 }
                 if errno != 0 {
                     print ("Error writing data to the child, errno=\(errno)")
                 }
-            })
+            }
         }
 
     }
@@ -182,6 +186,8 @@ public class LocalProcess {
                 running = false
                 // delegate.processTerminated (self, exitCode: nil)
             }
+            io?.close()
+            io = nil
             return
         }
         var b: [UInt8] = Array.init(repeating: 0, count: data.count)
@@ -314,9 +320,6 @@ public class LocalProcess {
             
             // Create pseudo-terminal pair using openpty
             let (master, slave) = try createPseudoTerminal()
-            self.masterFd = master
-            self.slaveFd = slave
-            self.childfd = master
             
             // Set window size on the master fd
             _ = PseudoTerminalHelpers.setWinSize(masterPtyDescriptor: master, windowSize: &size)
@@ -331,19 +334,49 @@ public class LocalProcess {
                 }
             }
             
+            // Duplicate the slave FD so stdin/stdout/stderr have explicit ownership.
+            let stdinFd = dup(slave)
+            guard stdinFd >= 0 else {
+                close(master)
+                close(slave)
+                throw POSIXError(.init(rawValue: errno)!)
+            }
+            let stdoutFd = dup(slave)
+            guard stdoutFd >= 0 else {
+                close(stdinFd)
+                close(master)
+                close(slave)
+                throw POSIXError(.init(rawValue: errno)!)
+            }
+            let stderrFd = dup(slave)
+            guard stderrFd >= 0 else {
+                close(stdinFd)
+                close(stdoutFd)
+                close(master)
+                close(slave)
+                throw POSIXError(.init(rawValue: errno)!)
+            }
+
+            // Close the original slave FD in the parent; the subprocess uses the duplicates.
+            close(slave)
+
             // Create FileDescriptor instances for swift-subprocess
-            let slaveFileDescriptor = System.FileDescriptor(rawValue: slave)
+            let stdinFileDescriptor = System.FileDescriptor(rawValue: stdinFd)
+            let stdoutFileDescriptor = System.FileDescriptor(rawValue: stdoutFd)
+            let stderrFileDescriptor = System.FileDescriptor(rawValue: stderrFd)
+
+            self.masterFd = master
+            self.slaveFd = -1
+            self.childfd = master
             
             // Mark as running and set up I/O for reading from master fd first
             running = true
             // Capture FD values for cleanup handler to close them safely after DispatchIO is done
             let masterToClose = master
-            let slaveToClose = slave
             io = DispatchIO(type: .stream, fileDescriptor: master, queue: dispatchQueue, cleanupHandler: { _ in
-                // Close file descriptors after DispatchIO has finished with them
+                // Close file descriptor after DispatchIO has finished with it
                 // This prevents EV_VANISHED crash by ensuring proper cleanup order
                 close(masterToClose)
-                close(slaveToClose)
             })
             guard let io else {
                 return
@@ -353,7 +386,10 @@ public class LocalProcess {
             io.read(offset: 0, length: readSize, queue: readQueue, ioHandler: childProcessRead)
             
             // Start subprocess with swift-subprocess asynchronously
-            Task {
+            subprocessTask?.cancel()
+            subprocessTask = Task { [weak self] in
+                guard let self else { return }
+                defer { self.subprocessTask = nil }
                 do {
                     // Start subprocess with swift-subprocess, using the slave side of the pty
                     // The subprocess will automatically handle the pseudo-terminal setup when using FileDescriptor I/O
@@ -370,9 +406,9 @@ public class LocalProcess {
                         environment: .custom(Dictionary(uniqueKeysWithValues: env.map { (Environment.Key(stringLiteral: $0.key), $0.value) })),
                         workingDirectory: currentDirectory.map { System.FilePath($0) },
                         platformOptions: options,
-                        input: .fileDescriptor(slaveFileDescriptor, closeAfterSpawningProcess: true),
-                        output: .fileDescriptor(slaveFileDescriptor, closeAfterSpawningProcess: false),
-                        error: .fileDescriptor(slaveFileDescriptor, closeAfterSpawningProcess: false)
+                        input: .fileDescriptor(stdinFileDescriptor, closeAfterSpawningProcess: true),
+                        output: .fileDescriptor(stdoutFileDescriptor, closeAfterSpawningProcess: true),
+                        error: .fileDescriptor(stderrFileDescriptor, closeAfterSpawningProcess: true)
                     )
                     
                     // Process completed
@@ -389,6 +425,9 @@ public class LocalProcess {
                     }
                     
                 } catch {
+                    close(stdinFd)
+                    close(stdoutFd)
+                    close(stderrFd)
                     await MainActor.run {
                         self.running = false  
                         self.delegate?.processTerminated(self, exitCode: nil)
